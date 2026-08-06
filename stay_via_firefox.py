@@ -41,6 +41,9 @@ MARIONETTE_PORT = 2828
 IDLE_THRESHOLD_SEC = 5 * 60
 POLL_EVERY_SEC = 20
 STARTUP_TIMEOUT_SEC = 60
+# Don't hammer Firefox into a visible restart storm.
+FF_RETRY_MIN_SEC = 30
+FF_RETRY_MAX_SEC = 5 * 60
 # School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~50ms.
 SCHOOL_PROBE_KILL_EVERY_SEC = 0.05
 # pkill -f uses ERE — avoid $ () etc. School JS has "(1, t); }", ours uses "(1, x)".
@@ -405,6 +408,7 @@ def prepare_profile() -> None:
 
 
 def kill_stale_stay_firefox() -> None:
+    """Kill only main firefox binaries using our stay profile (not helpers)."""
     try:
         out = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True)
     except Exception:
@@ -412,6 +416,9 @@ def kill_stale_stay_firefox() -> None:
     profile_token = str(PROFILE)
     for line in out.splitlines():
         if profile_token not in line:
+            continue
+        # plugin-container / gpu-helper also contain the profile path — skip them.
+        if "/MacOS/firefox" not in line and "/MacOS/firefox-bin" not in line:
             continue
         try:
             pid = int(line.strip().split(None, 1)[0])
@@ -423,6 +430,12 @@ def kill_stale_stay_firefox() -> None:
         except OSError:
             pass
     time.sleep(1.0)
+    # Clear leftover locks so the next launch can bind Marionette.
+    for name in ("lock", ".parentlock", "MarionetteActivePort"):
+        try:
+            (PROFILE / name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def start_firefox(firefox: Path) -> subprocess.Popen:
@@ -435,11 +448,13 @@ def start_firefox(firefox: Path) -> subprocess.Popen:
         "-no-remote",
         "-profile",
         str(PROFILE),
-        "-foreground",
+        # Headless: no Dock bounce / window flash on restart storms.
+        "-headless",
         "about:blank",
     ]
     env = os.environ.copy()
     env["MOZ_REMOTE_ALLOW_SYSTEM_ACCESS"] = "1"
+    env["MOZ_HEADLESS"] = "1"
     log("starting: " + " ".join(cmd))
     return subprocess.Popen(
         cmd,
@@ -450,23 +465,46 @@ def start_firefox(firefox: Path) -> subprocess.Popen:
     )
 
 
+def stop_firefox(proc) -> None:
+    if proc is None:
+        return
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        deadline = time.time() + 3
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+    kill_stale_stay_firefox()
+
+
 def ensure_engine(firefox: Path, proc, client):
     """Return (proc, client), restarting Firefox/Marionette if needed."""
     alive = proc is not None and proc.poll() is None
     if alive and client is not None:
         return proc, client
 
-    if proc is not None and proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
-        time.sleep(1)
+    stop_firefox(proc)
 
     proc = start_firefox(firefox)
     if not wait_port(MARIONETTE_PORT, STARTUP_TIMEOUT_SEC):
+        stop_firefox(proc)
         raise RuntimeError("Marionette port не открылся")
-    client = Marionette(port=MARIONETTE_PORT)
+    try:
+        client = Marionette(port=MARIONETTE_PORT)
+    except Exception:
+        stop_firefox(proc)
+        raise
+    # Headless — no window to minimize; keep call harmless if UI exists.
     try:
         client.execute(MINIMIZE_SCRIPT)
     except Exception as e:
@@ -543,15 +581,16 @@ def main() -> int:
     log("bundle: org.mozilla.firefoxdeveloperedition (нужен Accessibility в Mosyle)")
     log(f"Log: {LOG}")
     log(
-        f"Режим: следим за idle; если ≥ {IDLE_THRESHOLD_SEC // 60} мин бездействия "
-        f"→ jiggle (политика logout ≈ 30 мин). Один запуск на весь день."
+        f"Режим: school-blocker (60мин) всегда; "
+        f"HID-jiggle если idle ≥ {IDLE_THRESHOLD_SEC // 60} мин (Mosyle ~30мин)."
     )
 
     proc = None
     client = None
     last_heartbeat = 0.0
     stop_blocker = threading.Event()
-    blocker_thread = None
+    ff_retry_sec = FF_RETRY_MIN_SEC
+    next_ff_try = 0.0
 
     def shutdown(*_args):
         log("stopping…")
@@ -562,61 +601,82 @@ def main() -> int:
                 client.close()
         except Exception:
             pass
-        if proc is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
+        stop_firefox(proc)
         release_pid()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start school blocker ASAP — before Firefox bring-up — so a 15s tick can't win.
-    blocker_thread = start_school_probe_blocker(stop_blocker)
+    # School blocker first — works even if Firefox never comes up.
+    start_school_probe_blocker(stop_blocker)
 
-    try:
-        proc, client = ensure_engine(firefox, proc, client)
-        # May not prove reset if user just launched (idle already ~0).
-        jiggle(client, require_proof=False)
-        write_status("armed", hid_idle_seconds(), "startup jiggle + school-blocker")
-    except Exception as e:
-        log(f"startup failed: {e}")
-        write_status("error", hid_idle_seconds(), str(e))
-        stop_blocker.set()
-        release_pid()
-        return 1
+    def try_start_firefox(reason: str) -> bool:
+        nonlocal proc, client, ff_retry_sec, next_ff_try
+        now = time.time()
+        if now < next_ff_try:
+            return False
+        log(f"Firefox bring-up ({reason})")
+        try:
+            proc, client = ensure_engine(firefox, None, None)
+            jiggle(client, require_proof=False)
+            ff_retry_sec = FF_RETRY_MIN_SEC
+            next_ff_try = 0.0
+            write_status("armed", hid_idle_seconds(), "jiggle + school-blocker")
+            log("Firefox engine OK")
+            return True
+        except Exception as e:
+            log(f"Firefox bring-up failed: {e}; next try in {ff_retry_sec}s")
+            write_status(
+                "watching",
+                hid_idle_seconds(),
+                f"blocker=on firefox=down retry={ff_retry_sec}s",
+            )
+            proc, client = None, None
+            next_ff_try = time.time() + ff_retry_sec
+            ff_retry_sec = min(ff_retry_sec * 2, FF_RETRY_MAX_SEC)
+            return False
+
+    try_start_firefox("startup")
 
     if "--once" in sys.argv:
-        log("--once: success, exiting")
+        log("--once: done, exiting")
         shutdown()
         return 0
 
     log(
-        f"готово на весь день: HID-jiggle если idle ≥ {IDLE_THRESHOLD_SEC // 60} мин; "
-        "school 60мин — блокировка osascript-замера"
+        "готово на весь день: school-blocker активен; "
+        "Firefox headless только для Mosyle-jiggle"
     )
 
     while True:
         time.sleep(POLL_EVERY_SEC)
         idle = hid_idle_seconds()
-        # school metric is informational; blocker is the real countermeasure
         school = school_idle_seconds()
         now = time.time()
         try:
-            if proc.poll() is not None:
-                log("Firefox умер — перезапуск")
-                proc, client = ensure_engine(firefox, None, None)
+            ff_alive = proc is not None and proc.poll() is None and client is not None
+            if proc is not None and proc.poll() is not None:
+                log("Firefox процесс вышел — backoff restart")
+                client = None
+                proc = None
+                if next_ff_try < now:
+                    next_ff_try = now  # allow immediate schedule via try_start
+                try_start_firefox("process exited")
+                ff_alive = proc is not None and proc.poll() is None and client is not None
+
+            if not ff_alive:
+                try_start_firefox("engine down")
 
             if idle < 0:
                 write_status("error", idle, "cannot read HIDIdleTime")
                 continue
 
             if now - last_heartbeat >= 120:
+                ff_state = "up" if ff_alive else "down"
                 log(
                     f"heartbeat hid={idle:.0f}s school≈{school:.0f}s "
-                    f"threshold={IDLE_THRESHOLD_SEC}s blocker=on"
+                    f"threshold={IDLE_THRESHOLD_SEC}s blocker=on firefox={ff_state}"
                 )
                 last_heartbeat = now
 
@@ -624,7 +684,16 @@ def main() -> int:
                 write_status(
                     "watching",
                     idle,
-                    f"hid={idle:.0f} school≈{school:.0f} blocker=on",
+                    f"hid={idle:.0f} school≈{school:.0f} blocker=on "
+                    f"firefox={'up' if ff_alive else 'down'}",
+                )
+                continue
+
+            if not ff_alive or client is None:
+                write_status(
+                    "watching",
+                    idle,
+                    "blocker=on firefox=down (Mosyle jiggle unavailable)",
                 )
                 continue
 
@@ -634,18 +703,16 @@ def main() -> int:
                 jiggle(client, require_proof=True)
                 write_status("armed", hid_idle_seconds(), "jiggle ok + blocker")
             except Exception as e:
-                log(f"jiggle error: {e}; reconnecting")
-                proc, client = ensure_engine(firefox, None, None)
-                jiggle(client, require_proof=True)
-                write_status("armed", hid_idle_seconds(), "jiggle ok after reconnect")
+                log(f"jiggle error: {e}; will backoff-restart Firefox")
+                stop_firefox(proc)
+                proc, client = None, None
+                next_ff_try = time.time()  # try soon once
+                ff_retry_sec = FF_RETRY_MIN_SEC
+                try_start_firefox("after jiggle error")
         except Exception as e:
             log(f"loop error: {e}")
             write_status("error", idle, str(e))
             time.sleep(5)
-            try:
-                proc, client = ensure_engine(firefox, None, None)
-            except Exception as e2:
-                log(f"restart failed: {e2}")
 
     return 0
 
