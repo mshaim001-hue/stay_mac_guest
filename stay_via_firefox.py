@@ -45,7 +45,8 @@ STARTUP_TIMEOUT_SEC = 60
 FF_RETRY_MIN_SEC = 30
 FF_RETRY_MAX_SEC = 5 * 60
 # School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~50ms.
-SCHOOL_PROBE_KILL_EVERY_SEC = 0.05
+# Run faster on slow Macs to reduce miss chance.
+SCHOOL_PROBE_KILL_EVERY_SEC = 0.02
 # pkill -f uses ERE — avoid $ () etc. School JS has "(1, t); }", ours uses "(1, x)".
 SCHOOL_PROBE_PATTERN = "CGEventSourceSecondsSinceLastEventType(1, t)"
 SCHOOL_DIALOG_PATTERN = "Автовыход"
@@ -241,13 +242,14 @@ def school_idle_seconds() -> float:
         return -1.0
 
 
-def kill_school_osascripts() -> int:
+def kill_school_osascripts() -> tuple[int, str]:
     """Kill Guest osascripts used by idle-logout.sh (probe + warn dialog).
 
     idle-logout.sh does: idle=$(osascript …); [[ "$idle" =~ ^[0-9]+$ ]] || exit 0
     Empty/killed probe ⇒ no WARN, no launchctl bootout.
     """
     killed = 0
+    sample = ""
     try:
         pids_raw = subprocess.check_output(
             ["pgrep", "-f", "/usr/bin/osascript"], text=True, stderr=subprocess.DEVNULL
@@ -281,13 +283,15 @@ def kill_school_osascripts() -> int:
         try:
             os.kill(pid, signal.SIGKILL)
             killed += 1
+            if not sample:
+                sample = cmd[:220]
         except OSError:
             continue
-    return killed
+    return killed, sample
 
 
 def start_school_probe_blocker(stop_event: threading.Event) -> threading.Thread:
-    stats = {"kills": 0, "ticks": 0}
+    stats = {"kills": 0, "ticks": 0, "samples": 0}
 
     def loop() -> None:
         log(
@@ -297,18 +301,22 @@ def start_school_probe_blocker(stop_event: threading.Event) -> threading.Thread:
         last_report = time.time()
         while not stop_event.is_set():
             stats["ticks"] += 1
-            n = kill_school_osascripts()
+            n, sample = kill_school_osascripts()
             if n:
                 stats["kills"] += n
+                if sample and stats["samples"] < 3:
+                    log(f"school-blocker hit: {sample}")
+                    stats["samples"] += 1
             now = time.time()
             if now - last_report >= 120:
                 log(
                     f"school-blocker heartbeat ticks={stats['ticks']} "
-                    f"kill-waves={stats['kills']}"
+                    f"kill-waves={stats['kills']} interval={SCHOOL_PROBE_KILL_EVERY_SEC}s"
                 )
                 last_report = now
                 stats["ticks"] = 0
                 stats["kills"] = 0
+                stats["samples"] = 0
             stop_event.wait(SCHOOL_PROBE_KILL_EVERY_SEC)
         log("school-blocker OFF")
 
