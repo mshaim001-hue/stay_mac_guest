@@ -1,0 +1,8 @@
+dist/
+*.o
+.DS_Store
+probe*
+Sources/.build/
+ff-stay-profile/
+__pycache__/
+*.pyc
