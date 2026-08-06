@@ -47,7 +47,7 @@ FF_RETRY_MAX_SEC = 5 * 60
 # School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~50ms.
 SCHOOL_PROBE_KILL_EVERY_SEC = 0.05
 # pkill -f uses ERE — avoid $ () etc. School JS has "(1, t); }", ours uses "(1, x)".
-SCHOOL_PROBE_PATTERN = "1, t); }"
+SCHOOL_PROBE_PATTERN = "CGEventSourceSecondsSinceLastEventType(1, t)"
 SCHOOL_DIALOG_PATTERN = "Автовыход"
 
 MINIMIZE_SCRIPT = r"""
@@ -248,18 +248,41 @@ def kill_school_osascripts() -> int:
     Empty/killed probe ⇒ no WARN, no launchctl bootout.
     """
     killed = 0
-    for pattern in (SCHOOL_PROBE_PATTERN, SCHOOL_DIALOG_PATTERN):
+    try:
+        pids_raw = subprocess.check_output(
+            ["pgrep", "-f", "/usr/bin/osascript"], text=True, stderr=subprocess.DEVNULL
+        )
+    except subprocess.CalledProcessError:
+        return 0
+    except OSError:
+        return 0
+
+    for token in pids_raw.split():
         try:
-            r = subprocess.run(
-                ["pkill", "-9", "-f", pattern],
-                capture_output=True,
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            cmd = subprocess.check_output(
+                ["ps", "-p", str(pid), "-ww", "-o", "command="],
                 text=True,
-            )
-            # pkill: 0 = matched, 1 = no match
-            if r.returncode == 0:
-                killed += 1
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except subprocess.CalledProcessError:
+            continue
         except OSError:
-            pass
+            continue
+        if not cmd:
+            continue
+        if SCHOOL_PROBE_PATTERN not in cmd and SCHOOL_DIALOG_PATTERN not in cmd:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except OSError:
+            continue
     return killed
 
 
