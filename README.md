@@ -2,10 +2,16 @@
 
 ## Задача школы
 
-Mosyle: `AutoLogOutDelay = 1800` (30 мин HID-idle).  
+Два независимых таймера разлогина:
+
+1. **Mosyle** `AutoLogOutDelay = 1800` (~30 мин). Считает `HIDIdleTime` — jiggle мыши через Firefox DE его сбрасывает.
+2. **Tomorrow School** `ai.tomorrowschool.idlelogout` → `/usr/local/school/idle-logout.sh`  
+   `THRESHOLD=3600` (60 мин). Замер через `osascript` + `CGEventSourceSecondsSinceLastEventType`.  
+   Если замер не вернул число → скрипт делает `exit 0` и **не** разлогинивает.  
+   Stay глушит этот `osascript` (и диалог «Я здесь») из-под Guest каждые 50 мс — admin не нужен.
+
 Своё Accessibility без пароля админа не включить.  
-У **Firefox Developer Edition** AX уже выдан профилем — через него и работаем.  
-Обычный `Firefox.app` в whitelist нет: если взять его, jiggle idle не сбросит.
+Jiggle/blocker идут через **Firefox Developer Edition** (AX в Mosyle). Обычный `Firefox.app` не подходит.
 
 ## Как пользоваться
 

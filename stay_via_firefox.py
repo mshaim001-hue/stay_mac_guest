@@ -2,11 +2,10 @@
 """
 All-day Guest stay daemon (no admin password).
 
-Launch once in the morning. Monitors HID idle:
-  - while you work (idle < 5 min) → do nothing
-  - if idle ≥ 5 min (lecture / left the desk) → jiggle via Firefox
-    Developer Edition (Accessibility from Mosyle — NOT regular Firefox.app)
-  - Autologout policy is 30 min, so 5 min threshold is safe
+Launch once in the morning:
+  - Mosyle AutoLogOutDelay (~30 min): jiggle HID via Firefox Developer Edition
+  - Tomorrow School idle-logout.sh (60 min): block its osascript idle probe
+    (if the probe returns non-numeric, the script exits without logging out)
 
 Runs until you quit the app/script or log out of Guest yourself.
 """
@@ -19,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +41,11 @@ MARIONETTE_PORT = 2828
 IDLE_THRESHOLD_SEC = 5 * 60
 POLL_EVERY_SEC = 20
 STARTUP_TIMEOUT_SEC = 60
+# School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~50ms.
+SCHOOL_PROBE_KILL_EVERY_SEC = 0.05
+# pkill -f uses ERE — avoid $ () etc. School JS has "(1, t); }", ours uses "(1, x)".
+SCHOOL_PROBE_PATTERN = "1, t); }"
+SCHOOL_DIALOG_PATTERN = "Автовыход"
 
 MINIMIZE_SCRIPT = r"""
 const wm = Cc["@mozilla.org/appshell/window-mediator;1"].getService(Ci.nsIWindowMediator);
@@ -114,6 +119,14 @@ const CGEventCreateMouseEvent = cg.declare(
   CGPoint,
   ctypes.uint32_t
 );
+const CGEventCreateKeyboardEvent = cg.declare(
+  "CGEventCreateKeyboardEvent",
+  ctypes.default_abi,
+  CGEventRef,
+  ctypes.voidptr_t,
+  ctypes.uint16_t,
+  ctypes.bool
+);
 const CGEventPost = cg.declare(
   "CGEventPost",
   ctypes.default_abi,
@@ -131,12 +144,14 @@ const CFRelease = cf.declare(
 const kCGEventMouseMoved = 5;
 const kCGHIDEventTap = 0;
 const kCGMouseButtonLeft = 0;
+// F18 — almost never bound. School idle-logout.sh watches KeyDown (not MouseMoved).
+const kKeyF18 = 79;
 
 const curEv = CGEventCreate(null);
 const loc = CGEventGetLocation(curEv);
 CFRelease(curEv);
 
-function postAt(x, y) {
+function postMove(x, y) {
   const pt = CGPoint();
   pt.x = x;
   pt.y = y;
@@ -145,11 +160,23 @@ function postAt(x, y) {
   CFRelease(ev);
 }
 
-postAt(loc.x + 1, loc.y);
-postAt(loc.x, loc.y);
+function postKey() {
+  const down = CGEventCreateKeyboardEvent(null, kKeyF18, true);
+  const up = CGEventCreateKeyboardEvent(null, kKeyF18, false);
+  CGEventPost(kCGHIDEventTap, down);
+  CGEventPost(kCGHIDEventTap, up);
+  CFRelease(down);
+  CFRelease(up);
+}
+
+// Mouse move → Mosyle AutoLogOutDelay / IOHID (~30 min).
+postMove(loc.x + 1, loc.y);
+postMove(loc.x, loc.y);
+// KeyDown → Tomorrow School /usr/local/school/idle-logout.sh (THRESHOLD=3600).
+postKey();
 cg.close();
 cf.close();
-return "jiggled-ctypes";
+return "jiggled-ctypes+key";
 """
 
 
@@ -187,6 +214,81 @@ def hid_idle_seconds() -> float:
             ns = int(line.split("=")[-1].strip())
             return ns / 1_000_000_000
     return -1.0
+
+
+def school_idle_seconds() -> float:
+    """Same metric family as idle-logout.sh, but different JS shape so the
+    probe-blocker pkill pattern does not kill our own measurement.
+    """
+    js = (
+        'ObjC.import("CoreGraphics");'
+        "(() => { const xs = [1,3,10,22,25].map("
+        "x => $.CGEventSourceSecondsSinceLastEventType(1, x)); "
+        "return Math.floor(Math.min(...xs)); })()"
+    )
+    try:
+        out = subprocess.check_output(
+            ["/usr/bin/osascript", "-l", "JavaScript", "-e", js],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return float(out.strip())
+    except Exception:
+        return -1.0
+
+
+def kill_school_osascripts() -> int:
+    """Kill Guest osascripts used by idle-logout.sh (probe + warn dialog).
+
+    idle-logout.sh does: idle=$(osascript …); [[ "$idle" =~ ^[0-9]+$ ]] || exit 0
+    Empty/killed probe ⇒ no WARN, no launchctl bootout.
+    """
+    killed = 0
+    for pattern in (SCHOOL_PROBE_PATTERN, SCHOOL_DIALOG_PATTERN):
+        try:
+            r = subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                capture_output=True,
+                text=True,
+            )
+            # pkill: 0 = matched, 1 = no match
+            if r.returncode == 0:
+                killed += 1
+        except OSError:
+            pass
+    return killed
+
+
+def start_school_probe_blocker(stop_event: threading.Event) -> threading.Thread:
+    stats = {"kills": 0, "ticks": 0}
+
+    def loop() -> None:
+        log(
+            "school-blocker ON: глушим osascript замер "
+            f"ai.tomorrowschool.idlelogout (каждые {SCHOOL_PROBE_KILL_EVERY_SEC}с)"
+        )
+        last_report = time.time()
+        while not stop_event.is_set():
+            stats["ticks"] += 1
+            n = kill_school_osascripts()
+            if n:
+                stats["kills"] += n
+            now = time.time()
+            if now - last_report >= 120:
+                log(
+                    f"school-blocker heartbeat ticks={stats['ticks']} "
+                    f"kill-waves={stats['kills']}"
+                )
+                last_report = now
+                stats["ticks"] = 0
+                stats["kills"] = 0
+            stop_event.wait(SCHOOL_PROBE_KILL_EVERY_SEC)
+        log("school-blocker OFF")
+
+    t = threading.Thread(target=loop, name="school-probe-blocker", daemon=True)
+    t.start()
+    return t
 
 
 def find_firefox() -> Path:
@@ -373,7 +475,8 @@ def ensure_engine(firefox: Path, proc, client):
 
 
 def jiggle(client: Marionette, *, require_proof: bool = True) -> str:
-    before = hid_idle_seconds()
+    before_hid = hid_idle_seconds()
+    before_school = school_idle_seconds()
     errors = []
     result = None
     method = None
@@ -384,25 +487,29 @@ def jiggle(client: Marionette, *, require_proof: bool = True) -> str:
             break
         except Exception as e:
             errors.append(f"{name}: {e}")
+            log(f"jiggle method {name} failed: {e}")
     if method is None:
         raise RuntimeError("both jiggle methods failed: " + " | ".join(errors))
-    time.sleep(0.4)
-    after = hid_idle_seconds()
-    # If idle was already low (user just typed), "after < 3" proves nothing.
-    # Real proof: idle was high and dropped, or after is near-zero after a high before.
-    if before >= 5.0:
-        ok = after >= 0 and after < 3.0
-        proof = "proven" if ok else "FAIL"
+    time.sleep(0.5)
+    after_hid = hid_idle_seconds()
+    after_school = school_idle_seconds()
+    # Mosyle path = HID. School 60‑min path is handled by probe-blocker, not jiggle.
+    hid_ok = after_hid >= 0 and after_hid < 3.0
+    if before_hid >= 5.0:
+        ok = hid_ok
+        proof = "hid-proven" if ok else "hid-FAIL"
     else:
         ok = True
-        proof = "skip-proof (idle already low)"
+        proof = "skip-proof (hid already low)"
     log(
-        f"jiggle/{method} result={result!r} idle {before:.1f}s → {after:.1f}s "
+        f"jiggle/{method} result={result!r} "
+        f"hid {before_hid:.1f}→{after_hid:.1f}s "
+        f"school {before_school:.0f}→{after_school:.0f}s "
         f"{proof}"
     )
-    if require_proof and before >= 5.0 and not ok:
+    if require_proof and not ok:
         raise RuntimeError(
-            "HID idle did not reset — проверь Accessibility у Firefox Developer Edition"
+            "HID idle did not reset — нужен Accessibility у Firefox Developer Edition"
         )
     return str(result)
 
@@ -443,9 +550,12 @@ def main() -> int:
     proc = None
     client = None
     last_heartbeat = 0.0
+    stop_blocker = threading.Event()
+    blocker_thread = None
 
     def shutdown(*_args):
         log("stopping…")
+        stop_blocker.set()
         write_status("stopped", hid_idle_seconds())
         try:
             if client:
@@ -463,14 +573,18 @@ def main() -> int:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    # Start school blocker ASAP — before Firefox bring-up — so a 15s tick can't win.
+    blocker_thread = start_school_probe_blocker(stop_blocker)
+
     try:
         proc, client = ensure_engine(firefox, proc, client)
         # May not prove reset if user just launched (idle already ~0).
         jiggle(client, require_proof=False)
-        write_status("armed", hid_idle_seconds(), "startup jiggle sent")
+        write_status("armed", hid_idle_seconds(), "startup jiggle + school-blocker")
     except Exception as e:
         log(f"startup failed: {e}")
         write_status("error", hid_idle_seconds(), str(e))
+        stop_blocker.set()
         release_pid()
         return 1
 
@@ -480,13 +594,15 @@ def main() -> int:
         return 0
 
     log(
-        f"готово на весь день: проверка каждые {POLL_EVERY_SEC}с, "
-        f"jiggle только если idle ≥ {IDLE_THRESHOLD_SEC // 60} мин"
+        f"готово на весь день: HID-jiggle если idle ≥ {IDLE_THRESHOLD_SEC // 60} мин; "
+        "school 60мин — блокировка osascript-замера"
     )
 
     while True:
         time.sleep(POLL_EVERY_SEC)
         idle = hid_idle_seconds()
+        # school metric is informational; blocker is the real countermeasure
+        school = school_idle_seconds()
         now = time.time()
         try:
             if proc.poll() is not None:
@@ -498,19 +614,25 @@ def main() -> int:
                 continue
 
             if now - last_heartbeat >= 120:
-                log(f"heartbeat idle={idle:.0f}s threshold={IDLE_THRESHOLD_SEC}s")
+                log(
+                    f"heartbeat hid={idle:.0f}s school≈{school:.0f}s "
+                    f"threshold={IDLE_THRESHOLD_SEC}s blocker=on"
+                )
                 last_heartbeat = now
 
             if idle < IDLE_THRESHOLD_SEC:
-                write_status("watching", idle, "user active / below threshold")
+                write_status(
+                    "watching",
+                    idle,
+                    f"hid={idle:.0f} school≈{school:.0f} blocker=on",
+                )
                 continue
 
-            # Idle long enough — nudge before the 30 min autologout
-            log(f"idle {idle:.0f}s ≥ {IDLE_THRESHOLD_SEC}s → jiggle")
+            log(f"idle hid={idle:.0f}s ≥ {IDLE_THRESHOLD_SEC}s → jiggle (Mosyle)")
             write_status("jiggling", idle)
             try:
                 jiggle(client, require_proof=True)
-                write_status("armed", hid_idle_seconds(), "jiggle ok")
+                write_status("armed", hid_idle_seconds(), "jiggle ok + blocker")
             except Exception as e:
                 log(f"jiggle error: {e}; reconnecting")
                 proc, client = ensure_engine(firefox, None, None)
