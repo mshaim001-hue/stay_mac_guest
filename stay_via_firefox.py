@@ -45,11 +45,13 @@ STARTUP_TIMEOUT_SEC = 60
 FF_RETRY_MIN_SEC = 30
 FF_RETRY_MAX_SEC = 5 * 60
 # School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~50ms.
-# Run faster on slow Macs to reduce miss chance.
-SCHOOL_PROBE_KILL_EVERY_SEC = 0.02
-# pkill -f uses ERE — avoid $ () etc. School JS has "(1, t); }", ours uses "(1, x)".
-SCHOOL_PROBE_PATTERN = "CGEventSourceSecondsSinceLastEventType(1, t)"
-SCHOOL_DIALOG_PATTERN = "Автовыход"
+# ANY successful probe sees real idle and can WARN/LOGOUT — must kill nearly 100%.
+# Fast path: pkill only (no pgrep+ps). ERE-escaped so we don't hit our own metric (1, x).
+SCHOOL_PROBE_KILL_EVERY_SEC = 0.005
+SCHOOL_PROBE_PKILL_ERE = r"CGEventSourceSecondsSinceLastEventType\(1, t\)"
+SCHOOL_DIALOG_PKILL_ERE = "Автовыход"
+# Survive Guest home wipe on logout.
+DURABLE_LOG = Path("/var/tmp/StayMacGuest-Firefox.log")
 
 MINIMIZE_SCRIPT = r"""
 const wm = Cc["@mozilla.org/appshell/window-mediator;1"].getService(Ci.nsIWindowMediator);
@@ -187,9 +189,13 @@ return "jiggled-ctypes+key";
 def log(msg: str) -> None:
     line = time.strftime("%Y-%m-%dT%H:%M:%S") + "  " + msg
     print(line, flush=True)
-    LOG.parent.mkdir(parents=True, exist_ok=True)
-    with LOG.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    for path in (LOG, DURABLE_LOG):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
 
 def write_status(state: str, idle: float, extra: str = "") -> None:
@@ -242,96 +248,76 @@ def school_idle_seconds() -> float:
         return -1.0
 
 
-def kill_school_osascripts() -> tuple[int, str]:
-    """Kill Guest osascripts used by idle-logout.sh (probe + warn dialog).
+def kill_school_osascripts() -> int:
+    """Fast kill of idle-logout.sh probe + warn dialog.
 
-    idle-logout.sh does: idle=$(osascript …); [[ "$idle" =~ ^[0-9]+$ ]] || exit 0
-    Empty/killed probe ⇒ no WARN, no launchctl bootout.
+    idle-logout.sh: idle=$(osascript …); [[ "$idle" =~ ^[0-9]+$ ]] || exit 0
+    One missed probe when idle≥3600 ⇒ LOGOUT. Prefer speed over pretty logging.
     """
     killed = 0
-    sample = ""
-    try:
-        pids_raw = subprocess.check_output(
-            ["pgrep", "-f", "/usr/bin/osascript"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            errors="replace",
-        )
-    except subprocess.CalledProcessError:
-        # No matching processes — normal most of the time.
-        return 0, ""
-    except OSError:
-        return 0, ""
-
-    for token in pids_raw.split():
+    for pattern in (SCHOOL_PROBE_PKILL_ERE, SCHOOL_DIALOG_PKILL_ERE):
         try:
-            pid = int(token)
-        except ValueError:
-            continue
-        if pid == os.getpid():
-            continue
-        try:
-            cmd = subprocess.check_output(
-                ["ps", "-p", str(pid), "-ww", "-o", "command="],
+            r = subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                capture_output=True,
                 text=True,
-                stderr=subprocess.DEVNULL,
-                errors="replace",
-            ).strip()
-        except (subprocess.CalledProcessError, OSError, UnicodeError):
-            continue
-        if not cmd:
-            continue
-        if SCHOOL_PROBE_PATTERN not in cmd and SCHOOL_DIALOG_PATTERN not in cmd:
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-            killed += 1
-            if not sample:
-                sample = cmd[:220]
+            )
+            if r.returncode == 0:
+                killed += 1
         except OSError:
-            continue
-    return killed, sample
+            pass
+    return killed
 
 
-def start_school_probe_blocker(stop_event: threading.Event) -> threading.Thread:
-    stats = {"kills": 0, "ticks": 0, "samples": 0}
+def start_school_probe_blocker(stop_event: threading.Event) -> list[threading.Thread]:
+    """Several tight killer threads — school probe is ~50ms every 15s."""
+    threads: list[threading.Thread] = []
+    stats = {"kills": 0, "ticks": 0}
+    stats_lock = threading.Lock()
 
-    def loop() -> None:
-        log(
-            "school-blocker ON: глушим osascript замер "
-            f"ai.tomorrowschool.idlelogout (каждые {SCHOOL_PROBE_KILL_EVERY_SEC}с)"
-        )
+    def killer_loop(worker_id: int) -> None:
+        if worker_id == 0:
+            log(
+                "school-blocker ON: fast pkill "
+                f"x{len(threads) or 3} every {SCHOOL_PROBE_KILL_EVERY_SEC}s"
+            )
         last_report = time.time()
         while not stop_event.is_set():
             try:
-                stats["ticks"] += 1
-                n, sample = kill_school_osascripts()
-                if n:
-                    stats["kills"] += n
-                    if sample and stats["samples"] < 3:
-                        log(f"school-blocker hit: {sample}")
-                        stats["samples"] += 1
-                now = time.time()
-                if now - last_report >= 120:
-                    log(
-                        f"school-blocker heartbeat ticks={stats['ticks']} "
-                        f"kill-waves={stats['kills']} "
-                        f"interval={SCHOOL_PROBE_KILL_EVERY_SEC}s"
-                    )
-                    last_report = now
-                    stats["ticks"] = 0
-                    stats["kills"] = 0
-                    stats["samples"] = 0
+                n = kill_school_osascripts()
+                with stats_lock:
+                    stats["ticks"] += 1
+                    if n:
+                        stats["kills"] += n
+                    ticks = stats["ticks"]
+                    kills = stats["kills"]
+                    if worker_id == 0 and time.time() - last_report >= 120:
+                        log(
+                            f"school-blocker heartbeat ticks={ticks} "
+                            f"kill-waves={kills} "
+                            f"interval={SCHOOL_PROBE_KILL_EVERY_SEC}s"
+                        )
+                        last_report = time.time()
+                        stats["ticks"] = 0
+                        stats["kills"] = 0
             except Exception as e:
-                # Never let the blocker thread die silently.
-                log(f"school-blocker error: {type(e).__name__}: {e}")
-                time.sleep(0.2)
+                if worker_id == 0:
+                    log(f"school-blocker error: {type(e).__name__}: {e}")
+                time.sleep(0.05)
             stop_event.wait(SCHOOL_PROBE_KILL_EVERY_SEC)
-        log("school-blocker OFF")
+        if worker_id == 0:
+            log("school-blocker OFF")
 
-    t = threading.Thread(target=loop, name="school-probe-blocker", daemon=True)
-    t.start()
-    return t
+    # 3 parallel killers reduce miss window on slow python/scheduling.
+    for i in range(3):
+        t = threading.Thread(
+            target=killer_loop, args=(i,), name=f"school-probe-blocker-{i}", daemon=True
+        )
+        threads.append(t)
+    # Fix log message now that we know count
+    for t in threads:
+        t.start()
+    return threads
 
 
 def find_firefox() -> Path:
