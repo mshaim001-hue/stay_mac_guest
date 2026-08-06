@@ -252,12 +252,16 @@ def kill_school_osascripts() -> tuple[int, str]:
     sample = ""
     try:
         pids_raw = subprocess.check_output(
-            ["pgrep", "-f", "/usr/bin/osascript"], text=True, stderr=subprocess.DEVNULL
+            ["pgrep", "-f", "/usr/bin/osascript"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            errors="replace",
         )
     except subprocess.CalledProcessError:
-        return 0
+        # No matching processes — normal most of the time.
+        return 0, ""
     except OSError:
-        return 0
+        return 0, ""
 
     for token in pids_raw.split():
         try:
@@ -271,10 +275,9 @@ def kill_school_osascripts() -> tuple[int, str]:
                 ["ps", "-p", str(pid), "-ww", "-o", "command="],
                 text=True,
                 stderr=subprocess.DEVNULL,
+                errors="replace",
             ).strip()
-        except subprocess.CalledProcessError:
-            continue
-        except OSError:
+        except (subprocess.CalledProcessError, OSError, UnicodeError):
             continue
         if not cmd:
             continue
@@ -300,23 +303,29 @@ def start_school_probe_blocker(stop_event: threading.Event) -> threading.Thread:
         )
         last_report = time.time()
         while not stop_event.is_set():
-            stats["ticks"] += 1
-            n, sample = kill_school_osascripts()
-            if n:
-                stats["kills"] += n
-                if sample and stats["samples"] < 3:
-                    log(f"school-blocker hit: {sample}")
-                    stats["samples"] += 1
-            now = time.time()
-            if now - last_report >= 120:
-                log(
-                    f"school-blocker heartbeat ticks={stats['ticks']} "
-                    f"kill-waves={stats['kills']} interval={SCHOOL_PROBE_KILL_EVERY_SEC}s"
-                )
-                last_report = now
-                stats["ticks"] = 0
-                stats["kills"] = 0
-                stats["samples"] = 0
+            try:
+                stats["ticks"] += 1
+                n, sample = kill_school_osascripts()
+                if n:
+                    stats["kills"] += n
+                    if sample and stats["samples"] < 3:
+                        log(f"school-blocker hit: {sample}")
+                        stats["samples"] += 1
+                now = time.time()
+                if now - last_report >= 120:
+                    log(
+                        f"school-blocker heartbeat ticks={stats['ticks']} "
+                        f"kill-waves={stats['kills']} "
+                        f"interval={SCHOOL_PROBE_KILL_EVERY_SEC}s"
+                    )
+                    last_report = now
+                    stats["ticks"] = 0
+                    stats["kills"] = 0
+                    stats["samples"] = 0
+            except Exception as e:
+                # Never let the blocker thread die silently.
+                log(f"school-blocker error: {type(e).__name__}: {e}")
+                time.sleep(0.2)
             stop_event.wait(SCHOOL_PROBE_KILL_EVERY_SEC)
         log("school-blocker OFF")
 
