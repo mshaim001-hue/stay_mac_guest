@@ -6,7 +6,7 @@ import IOKit
 /// Does NOT need Accessibility — the heavy lifting is stay_via_firefox.py
 /// (jiggle via Firefox, which already has AX from Mosyle).
 
-let idleThresholdMinutes = 10
+let idleThresholdMinutes = 5
 let statusPollSeconds: TimeInterval = 5
 
 func repoRootCandidates() -> [URL] {

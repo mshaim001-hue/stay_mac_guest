@@ -3,10 +3,10 @@
 All-day Guest stay daemon (no admin password).
 
 Launch once in the morning. Monitors HID idle:
-  - while you work (idle < 10 min) → do nothing
-  - if idle ≥ 10 min (lecture / left the desk) → jiggle via Firefox
-    (Firefox already has Accessibility from Mosyle profile)
-  - Autologout policy is 30 min, so 10 min threshold is safe
+  - while you work (idle < 5 min) → do nothing
+  - if idle ≥ 5 min (lecture / left the desk) → jiggle via Firefox
+    Developer Edition (Accessibility from Mosyle — NOT regular Firefox.app)
+  - Autologout policy is 30 min, so 5 min threshold is safe
 
 Runs until you quit the app/script or log out of Guest yourself.
 """
@@ -29,14 +29,17 @@ PROFILE = SUPPORT / "ff-stay-profile"
 LOG = Path.home() / "Library/Logs/StayMacGuest-Firefox.log"
 PID_FILE = Path.home() / "Library/Logs/StayMacGuest-Firefox.pid"
 STATUS_FILE = Path.home() / "Library/Logs/StayMacGuest-Firefox.status"
-FIREFOX_CANDIDATES = [
-    Path("/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox"),
-    Path("/Applications/Firefox.app/Contents/MacOS/firefox"),
-]
+# Mosyle TCC Accessibility is granted to Firefox Developer Edition only
+# (org.mozilla.firefoxdeveloperedition). Regular Firefox.app must NOT be used —
+# CGEventPost without AX does not reset AutoLogOutDelay idle.
+FIREFOX_DEV = Path(
+    "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox"
+)
+FIREFOX_REGULAR = Path("/Applications/Firefox.app/Contents/MacOS/firefox")
 MARIONETTE_PORT = 2828
-# Autologout ≈ 1800s. Act well before that.
-IDLE_THRESHOLD_SEC = 10 * 60
-POLL_EVERY_SEC = 30
+# Autologout ≈ 1800s. Act well before that; jiggle earlier with margin.
+IDLE_THRESHOLD_SEC = 5 * 60
+POLL_EVERY_SEC = 20
 STARTUP_TIMEOUT_SEC = 60
 
 MINIMIZE_SCRIPT = r"""
@@ -187,10 +190,18 @@ def hid_idle_seconds() -> float:
 
 
 def find_firefox() -> Path:
-    for path in FIREFOX_CANDIDATES:
-        if path.is_file():
-            return path
-    raise SystemExit("Firefox / Firefox Developer Edition не найден в /Applications")
+    if FIREFOX_DEV.is_file():
+        return FIREFOX_DEV
+    if FIREFOX_REGULAR.is_file():
+        raise SystemExit(
+            "Найден только обычный Firefox.app — у него нет Accessibility в Mosyle.\n"
+            "Нужен Firefox Developer Edition (org.mozilla.firefoxdeveloperedition).\n"
+            "Иначе jiggle не сбросит idle и Guest разлогинит через ~30 мин."
+        )
+    raise SystemExit(
+        "Firefox Developer Edition не найден в /Applications.\n"
+        "Он обязателен: только у него Accessibility в профиле Mosyle."
+    )
 
 
 class Marionette:
@@ -361,7 +372,7 @@ def ensure_engine(firefox: Path, proc, client):
     return proc, client
 
 
-def jiggle(client: Marionette) -> str:
+def jiggle(client: Marionette, *, require_proof: bool = True) -> str:
     before = hid_idle_seconds()
     errors = []
     result = None
@@ -375,15 +386,24 @@ def jiggle(client: Marionette) -> str:
             errors.append(f"{name}: {e}")
     if method is None:
         raise RuntimeError("both jiggle methods failed: " + " | ".join(errors))
-    time.sleep(0.3)
+    time.sleep(0.4)
     after = hid_idle_seconds()
-    ok = after >= 0 and after < 3.0
+    # If idle was already low (user just typed), "after < 3" proves nothing.
+    # Real proof: idle was high and dropped, or after is near-zero after a high before.
+    if before >= 5.0:
+        ok = after >= 0 and after < 3.0
+        proof = "proven" if ok else "FAIL"
+    else:
+        ok = True
+        proof = "skip-proof (idle already low)"
     log(
         f"jiggle/{method} result={result!r} idle {before:.1f}s → {after:.1f}s "
-        f"{'OK' if ok else 'FAIL'}"
+        f"{proof}"
     )
-    if not ok:
-        raise RuntimeError("HID idle did not reset")
+    if require_proof and before >= 5.0 and not ok:
+        raise RuntimeError(
+            "HID idle did not reset — проверь Accessibility у Firefox Developer Edition"
+        )
     return str(result)
 
 
@@ -413,6 +433,7 @@ def main() -> int:
     firefox = find_firefox()
     claim_pid()
     log(f"Firefox: {firefox}")
+    log("bundle: org.mozilla.firefoxdeveloperedition (нужен Accessibility в Mosyle)")
     log(f"Log: {LOG}")
     log(
         f"Режим: следим за idle; если ≥ {IDLE_THRESHOLD_SEC // 60} мин бездействия "
@@ -421,6 +442,7 @@ def main() -> int:
 
     proc = None
     client = None
+    last_heartbeat = 0.0
 
     def shutdown(*_args):
         log("stopping…")
@@ -443,9 +465,9 @@ def main() -> int:
 
     try:
         proc, client = ensure_engine(firefox, proc, client)
-        # Proof on start
-        jiggle(client)
-        write_status("armed", hid_idle_seconds(), "startup jiggle ok")
+        # May not prove reset if user just launched (idle already ~0).
+        jiggle(client, require_proof=False)
+        write_status("armed", hid_idle_seconds(), "startup jiggle sent")
     except Exception as e:
         log(f"startup failed: {e}")
         write_status("error", hid_idle_seconds(), str(e))
@@ -465,6 +487,7 @@ def main() -> int:
     while True:
         time.sleep(POLL_EVERY_SEC)
         idle = hid_idle_seconds()
+        now = time.time()
         try:
             if proc.poll() is not None:
                 log("Firefox умер — перезапуск")
@@ -474,8 +497,11 @@ def main() -> int:
                 write_status("error", idle, "cannot read HIDIdleTime")
                 continue
 
+            if now - last_heartbeat >= 120:
+                log(f"heartbeat idle={idle:.0f}s threshold={IDLE_THRESHOLD_SEC}s")
+                last_heartbeat = now
+
             if idle < IDLE_THRESHOLD_SEC:
-                # User is active (or recently was) — nothing to do
                 write_status("watching", idle, "user active / below threshold")
                 continue
 
@@ -483,12 +509,12 @@ def main() -> int:
             log(f"idle {idle:.0f}s ≥ {IDLE_THRESHOLD_SEC}s → jiggle")
             write_status("jiggling", idle)
             try:
-                jiggle(client)
+                jiggle(client, require_proof=True)
                 write_status("armed", hid_idle_seconds(), "jiggle ok")
             except Exception as e:
                 log(f"jiggle error: {e}; reconnecting")
                 proc, client = ensure_engine(firefox, None, None)
-                jiggle(client)
+                jiggle(client, require_proof=True)
                 write_status("armed", hid_idle_seconds(), "jiggle ok after reconnect")
         except Exception as e:
             log(f"loop error: {e}")
