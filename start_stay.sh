@@ -4,7 +4,9 @@ cd "$(dirname "$0")"
 
 # Prefer menu-bar app if built; else raw daemon.
 if [[ -d dist/StayMacGuest.app ]]; then
-  echo "Запуск StayMacGuest (один раз с утра → весь день Guest)."
+  echo "Запуск StayMacGuest (сразу на паузе)."
+  echo "  Меню ⏳⏸ → «Ушёл — включить защиту» когда уходишь"
+  echo "  → «На месте — пауза» когда вернулся (killer/Firefox гасятся)"
   open dist/StayMacGuest.app
   exit 0
 fi

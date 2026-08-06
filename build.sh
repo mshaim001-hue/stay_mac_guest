@@ -47,6 +47,12 @@ swiftc -O \
   -o "$BIN"
 chmod +x "$BIN"
 
+echo "→ компиляция school_probe_killer (A1)…"
+cc -O2 -o "$RES/school_probe_killer" "$ROOT/tools/school_probe_killer.c"
+cp "$RES/school_probe_killer" "$ROOT/tools/school_probe_killer"
+cp "$RES/school_probe_killer" "$ROOT/dist/school_probe_killer"
+chmod +x "$RES/school_probe_killer" "$ROOT/tools/school_probe_killer" "$ROOT/dist/school_probe_killer"
+
 # Engine рядом с приложением (и копия в Resources)
 cp "$ROOT/stay_via_firefox.py" "$RES/stay_via_firefox.py"
 cp "$ROOT/stay_via_firefox.py" "$ROOT/dist/stay_via_firefox.py"
@@ -64,9 +70,9 @@ chmod +x "$ROOT/dist/start.command"
 echo
 echo "✅ Готово: $APP"
 echo
-echo "С утра один раз:"
+echo "Запуск:"
 echo "  open \"$APP\""
 echo
-echo "В меню-баре ⏳ — работает весь день Guest."
-echo "Jiggle только если idle ≥ 5 мин (лекция/отошёл)."
-echo "Пароль админа не нужен. Quit в меню — когда сам выходишь из Guest."
+echo "В меню-баре ⏳⏸ — пауза (можно работать)."
+echo "«Ушёл — включить защиту» / «На месте — пауза»."
+echo "Quit — полностью выйти."

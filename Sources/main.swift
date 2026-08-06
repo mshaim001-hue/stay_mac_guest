@@ -2,9 +2,8 @@ import AppKit
 import Foundation
 import IOKit
 
-/// Menu-bar controller: launch once in the morning, runs all day.
-/// Does NOT need Accessibility — the heavy lifting is stay_via_firefox.py
-/// (jiggle via Firefox, which already has AX from Mosyle).
+/// Menu-bar controller.
+/// Starts paused (no CPU). You arm when leaving; pause when back.
 
 let idleThresholdMinutes = 5
 let statusPollSeconds: TimeInterval = 5
@@ -73,6 +72,10 @@ final class StayController: NSObject {
     private var pollTimer: Timer?
     private var scriptURL: URL?
     private var statusMenuItem: NSMenuItem?
+    private var armMenuItem: NSMenuItem?
+    private var pauseMenuItem: NSMenuItem?
+    /// User wants protection on (away). False = paused, zero engine CPU.
+    private var armed = false
 
     func start() {
         scriptURL = findStayScript()
@@ -85,18 +88,30 @@ final class StayController: NSObject {
             return
         }
 
-        launchDaemon()
+        // Do NOT auto-start engine — wait until user leaves.
+        armed = false
+        applyPausedUI()
         pollTimer = Timer.scheduledTimer(withTimeInterval: statusPollSeconds, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
-        refreshStatus()
     }
 
     private func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        setTitle("⏳…")
+        setTitle("⏳⏸")
         let menu = NSMenu()
-        statusMenuItem = menu.addItem(withTitle: "Starting…", action: nil, keyEquivalent: "")
+        statusMenuItem = menu.addItem(withTitle: "Пауза — защита выключена", action: nil, keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        armMenuItem = menu.addItem(
+            withTitle: "Ушёл — включить защиту",
+            action: #selector(armProtection),
+            keyEquivalent: "a"
+        )
+        pauseMenuItem = menu.addItem(
+            withTitle: "На месте — пауза",
+            action: #selector(pauseProtection),
+            keyEquivalent: "p"
+        )
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "Restart engine", action: #selector(restartDaemon), keyEquivalent: "r")
         menu.addItem(withTitle: "Open log", action: #selector(openLog), keyEquivalent: "l")
@@ -104,11 +119,23 @@ final class StayController: NSObject {
         menu.addItem(withTitle: "Quit StayMacGuest", action: #selector(quit), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }
         statusItem?.menu = menu
-        statusItem?.button?.toolTip = "StayMacGuest — один запуск на весь день Guest"
+        statusItem?.button?.toolTip = "StayMacGuest — пауза, пока ты за Mac; включи когда уходишь"
+        updateMenuEnabled()
     }
 
     private func setTitle(_ text: String) {
         statusItem?.button?.title = text
+    }
+
+    private func updateMenuEnabled() {
+        armMenuItem?.isEnabled = !armed
+        pauseMenuItem?.isEnabled = armed
+    }
+
+    private func applyPausedUI() {
+        setTitle("⏳⏸")
+        statusMenuItem?.title = "Пауза — killer/Firefox выключены, можно работать"
+        updateMenuEnabled()
     }
 
     private func launchDaemon() {
@@ -125,29 +152,36 @@ final class StayController: NSObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 if self.process === proc {
-                    self.setTitle("⏳✗")
-                    self.statusMenuItem?.title = "Engine stopped (exit \(proc.terminationStatus))"
+                    self.process = nil
+                    if self.armed {
+                        self.setTitle("⏳✗")
+                        self.statusMenuItem?.title = "Engine stopped (exit \(proc.terminationStatus))"
+                    }
                 }
             }
         }
         do {
             try p.run()
             process = p
-            setTitle("⏳")
-            statusMenuItem?.title = "Engine starting…"
+            setTitle("⏳…")
+            statusMenuItem?.title = "Защита стартует…"
+            updateMenuEnabled()
         } catch {
+            armed = false
             setTitle("⏳!")
             statusMenuItem?.title = "Failed to start: \(error.localizedDescription)"
+            updateMenuEnabled()
         }
     }
 
     private func stopDaemon() {
         guard let p = process, p.isRunning else {
             process = nil
+            // Best-effort: reap orphan killer / engine from pid file
+            reapPidFile()
             return
         }
         p.terminate()
-        // Give python a moment to SIGTERM its Firefox group
         let deadline = Date().addingTimeInterval(2)
         while p.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
@@ -156,9 +190,31 @@ final class StayController: NSObject {
             p.interrupt()
         }
         process = nil
+        reapPidFile()
+        // Native killer forks workers — reap by name
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        task.arguments = ["-f", "school_probe_killer"]
+        try? task.run()
+        task.waitUntilExit()
+    }
+
+    private func reapPidFile() {
+        let pidURL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Logs/StayMacGuest-Firefox.pid")
+        if let text = try? String(contentsOf: pidURL, encoding: .utf8),
+           let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+           pid > 0 {
+            kill(pid, SIGTERM)
+        }
     }
 
     private func refreshStatus() {
+        if !armed {
+            applyPausedUI()
+            return
+        }
+
         let idle = hidIdleSeconds()
         let idleMin = idle / 60.0
         if let st = readDaemonStatus(),
@@ -168,9 +224,8 @@ final class StayController: NSObject {
             case "watching":
                 setTitle("⏳")
                 statusMenuItem?.title = String(
-                    format: "Смотрю · idle %.0f мин (порог %d) · работаешь — jiggle не нужен",
-                    idleShown / 60.0,
-                    idleThresholdMinutes
+                    format: "Защита ON · idle %.0f мин",
+                    idleShown / 60.0
                 )
             case "jiggling":
                 setTitle("⏳!")
@@ -178,7 +233,7 @@ final class StayController: NSObject {
             case "armed":
                 setTitle("⏳✓")
                 statusMenuItem?.title = String(
-                    format: "На страже · idle %.0f мин · jiggle если ≥ %d мин",
+                    format: "Защита ON · idle %.0f мин · jiggle если ≥ %d мин",
                     idleShown / 60.0,
                     idleThresholdMinutes
                 )
@@ -188,21 +243,37 @@ final class StayController: NSObject {
                 statusMenuItem?.title = "Ошибка: \(extra)"
             case "stopped":
                 setTitle("⏳·")
-                statusMenuItem?.title = "Остановлен"
+                statusMenuItem?.title = "Движок остановился"
             default:
                 setTitle("⏳")
                 statusMenuItem?.title = "\(state) · idle \(String(format: "%.0f", idleMin)) мин"
             }
         } else if process?.isRunning == true {
             setTitle("⏳…")
-            statusMenuItem?.title = String(format: "Starting… idle %.0f мин", idleMin)
+            statusMenuItem?.title = String(format: "Защита стартует… idle %.0f мин", idleMin)
         } else {
             setTitle("⏳?")
-            statusMenuItem?.title = String(format: "Нет статуса · idle %.0f мин", idleMin)
+            statusMenuItem?.title = "Защита ON, но нет статуса — Restart?"
         }
+        updateMenuEnabled()
+    }
+
+    @objc private func armProtection() {
+        guard scriptURL != nil else { return }
+        armed = true
+        launchDaemon()
+        statusMenuItem?.title = "Защита включается…"
+        updateMenuEnabled()
+    }
+
+    @objc private func pauseProtection() {
+        armed = false
+        stopDaemon()
+        applyPausedUI()
     }
 
     @objc private func restartDaemon() {
+        guard armed else { return }
         launchDaemon()
     }
 
@@ -213,15 +284,8 @@ final class StayController: NSObject {
     }
 
     @objc private func quit() {
+        armed = false
         stopDaemon()
-        // Also ask python via pid file if still around
-        let pidURL = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Logs/StayMacGuest-Firefox.pid")
-        if let text = try? String(contentsOf: pidURL, encoding: .utf8),
-           let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-           pid > 0 {
-            kill(pid, SIGTERM)
-        }
         NSApp.terminate(nil)
     }
 }

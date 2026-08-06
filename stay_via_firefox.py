@@ -44,12 +44,13 @@ STARTUP_TIMEOUT_SEC = 60
 # Don't hammer Firefox into a visible restart storm.
 FF_RETRY_MIN_SEC = 30
 FF_RETRY_MAX_SEC = 5 * 60
-# School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~50ms.
+# School LaunchDaemon runs idle-logout.sh every 15s; probe lasts ~45ms.
 # ANY successful probe sees real idle and can WARN/LOGOUT — must kill nearly 100%.
-# Fast path: pkill only (no pgrep+ps). ERE-escaped so we don't hit our own metric (1, x).
+# Prefer native busy-loop killer (A1); Python pkill is fallback only.
 SCHOOL_PROBE_KILL_EVERY_SEC = 0.005
 SCHOOL_PROBE_PKILL_ERE = r"CGEventSourceSecondsSinceLastEventType\(1, t\)"
 SCHOOL_DIALOG_PKILL_ERE = "Автовыход"
+SCHOOL_KILLER_WORKERS = 2
 # Survive Guest home wipe on logout.
 DURABLE_LOG = Path("/var/tmp/StayMacGuest-Firefox.log")
 
@@ -249,11 +250,7 @@ def school_idle_seconds() -> float:
 
 
 def kill_school_osascripts() -> int:
-    """Fast kill of idle-logout.sh probe + warn dialog.
-
-    idle-logout.sh: idle=$(osascript …); [[ "$idle" =~ ^[0-9]+$ ]] || exit 0
-    One missed probe when idle≥3600 ⇒ LOGOUT. Prefer speed over pretty logging.
-    """
+    """Fallback: pkill school probe + warn dialog (used if native killer missing)."""
     killed = 0
     for pattern in (SCHOOL_PROBE_PKILL_ERE, SCHOOL_DIALOG_PKILL_ERE):
         try:
@@ -269,16 +266,89 @@ def kill_school_osascripts() -> int:
     return killed
 
 
+def find_school_probe_killer() -> Path | None:
+    """Native A1 busy-loop binary next to engine / in tools/."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "school_probe_killer",
+        here.parent / "tools" / "school_probe_killer",
+        ROOT / "tools" / "school_probe_killer",
+        ROOT / "dist" / "school_probe_killer",
+        ROOT / "dist" / "StayMacGuest.app" / "Contents" / "Resources" / "school_probe_killer",
+    ]
+    for p in candidates:
+        try:
+            if p.is_file() and os.access(p, os.X_OK):
+                return p
+        except OSError:
+            continue
+    return None
+
+
 def start_school_probe_blocker(stop_event: threading.Event) -> list[threading.Thread]:
-    """Several tight killer threads — school probe is ~50ms every 15s."""
+    """Prefer native school_probe_killer; fall back to Python pkill threads."""
     threads: list[threading.Thread] = []
+    native = find_school_probe_killer()
+
+    if native is not None:
+        holder: dict[str, subprocess.Popen | None] = {"proc": None}
+
+        def native_loop() -> None:
+            log(
+                f"school-blocker ON: native {native.name} "
+                f"workers={SCHOOL_KILLER_WORKERS} (A1 busy-loop)"
+            )
+            while not stop_event.is_set():
+                try:
+                    proc = holder["proc"]
+                    if proc is None or proc.poll() is not None:
+                        if proc is not None and proc.poll() is not None:
+                            log(
+                                f"school-blocker native exited rc={proc.returncode} — restart"
+                            )
+                        holder["proc"] = subprocess.Popen(
+                            [
+                                str(native),
+                                "--workers",
+                                str(SCHOOL_KILLER_WORKERS),
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                except Exception as e:
+                    log(f"school-blocker native error: {type(e).__name__}: {e}")
+                    time.sleep(1)
+                stop_event.wait(2.0)
+            proc = holder["proc"]
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+            try:
+                subprocess.run(
+                    ["pkill", "-f", "school_probe_killer"],
+                    capture_output=True,
+                )
+            except OSError:
+                pass
+            log("school-blocker OFF")
+
+        t = threading.Thread(
+            target=native_loop, name="school-probe-blocker-native", daemon=True
+        )
+        threads.append(t)
+        t.start()
+        return threads
+
     stats = {"kills": 0, "ticks": 0}
     stats_lock = threading.Lock()
 
     def killer_loop(worker_id: int) -> None:
         if worker_id == 0:
             log(
-                "school-blocker ON: fast pkill "
+                "school-blocker ON: fallback pkill "
                 f"x{len(threads) or 3} every {SCHOOL_PROBE_KILL_EVERY_SEC}s"
             )
         last_report = time.time()
@@ -308,13 +378,11 @@ def start_school_probe_blocker(stop_event: threading.Event) -> list[threading.Th
         if worker_id == 0:
             log("school-blocker OFF")
 
-    # 3 parallel killers reduce miss window on slow python/scheduling.
     for i in range(3):
         t = threading.Thread(
             target=killer_loop, args=(i,), name=f"school-probe-blocker-{i}", daemon=True
         )
         threads.append(t)
-    # Fix log message now that we know count
     for t in threads:
         t.start()
     return threads
