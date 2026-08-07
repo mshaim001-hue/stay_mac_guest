@@ -36,10 +36,16 @@ cd ~/Desktop/stay_mac_guest
 
 ### Меню ⏳
 
-- статус (watching / armed / jiggle)
-- Restart engine
-- Open log → `~/Library/Logs/StayMacGuest-Firefox.log`
-- Quit — когда уходишь из Guest сам
+| Иконка | Что значит |
+|--------|------------|
+| ⏳⏸ | **На месте** — пауза, всё выключено |
+| ⏳✓ | **Ушёл**, Firefox готов, ждёт простоя ≥ 5 мин |
+| ⏳ | **Ушёл**, защита ON, идёт watching |
+| ⏳! | Прямо сейчас делает jiggle |
+| ⏳… | Стартует |
+| ⏳✗ / ⏳? | Ошибка / нет статуса |
+
+Пункты меню: **Ушёл** / **На месте**, Restart engine, Open log → `~/Library/Logs/StayMacGuest-Firefox.log`, Quit — когда уходишь из Guest сам.
 
 ### Проверка
 
